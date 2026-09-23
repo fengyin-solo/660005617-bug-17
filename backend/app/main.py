@@ -1,4 +1,4 @@
-import asyncio, time, random, json, threading
+import asyncio, time, random, json, threading, copy
 from collections import defaultdict, deque
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +9,19 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 ACTIVE_CLIENTS = []
 WORKFLOW_ID = 0
+
+# 已完成执行的冻结快照：评分只在这里算一次，HTTP / WebSocket / 重开页面都读同一份
+STATE_LOCK = threading.Lock()
+RUN_SEQ = 0
+LATEST_RUN = None
+EVENT_LOOP = None
+
+
+@app.on_event("startup")
+def _capture_event_loop():
+    # 执行线程里 asyncio.get_event_loop() 拿不到循环，启动时先抓住
+    global EVENT_LOOP
+    EVENT_LOOP = asyncio.get_event_loop()
 
 class WorkflowCreate(BaseModel):
     name: str = "data-pipeline"
@@ -58,6 +71,66 @@ def generate_dag_workflow(name: str):
     } for n in nodes], "edges": edges, "durations": {n["id"]: n["duration"] for n in nodes}}
 
 
+def compute_node_score(node, expected_duration):
+    """按同一次执行的最终状态给单个环节打分（确定性，不引入新的随机量）"""
+    if node["status"] == "SUCCESS":
+        base = 100
+    elif node["status"] in ("FAILED", "TIMEOUT"):
+        base = 40
+    else:
+        base = 0  # PENDING/RUNNING 不应出现在冻结快照里，兜底给 0
+
+    score = base - node["retries"] * 15  # 每次重试扣 15 分
+
+    # 按本次实际耗时与预期耗时的偏差微调（±10 分）
+    if node["startTime"] and node["endTime"] and expected_duration:
+        ratio = (node["endTime"] - node["startTime"]) / expected_duration
+        score += round(max(-1.0, min(1.0, 1.0 - ratio)) * 10)
+
+    return max(0, min(100, score))
+
+
+def build_score(run_id, nodes, durations):
+    """执行结束时对同一次执行的最终状态算一次分，算完即冻结"""
+    items = [{
+        "taskId": n["id"],
+        "name": n["name"],
+        "status": n["status"],
+        "retries": n["retries"],
+        "score": compute_node_score(n, durations.get(n["id"]))
+    } for n in nodes]
+    total = round(sum(i["score"] for i in items) / len(items)) if items else 0
+    return {"runId": run_id, "total": total, "items": items, "frozen": True}
+
+
+def build_snapshot(run_id, nodes, edges, logs, cb_state, completed, score=None):
+    """组装同一份执行快照；所有出口（HTTP / WebSocket / 重开查询）都走这里"""
+    return {
+        "runId": run_id,
+        "workflow": {"id": 1, "name": "workflow",
+                     "nodes": copy.deepcopy(nodes), "edges": edges},
+        "logs": logs[-30:],
+        "circuitBreakers": [{"taskId": k, **v} for k, v in cb_state.items()],
+        "completed": completed,
+        "score": score,
+    }
+
+
+def broadcast(payload):
+    if not ACTIVE_CLIENTS or EVENT_LOOP is None:
+        return
+    data = json.dumps(payload)
+    dead = []
+    for ws in list(ACTIVE_CLIENTS):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_text(data), EVENT_LOOP)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
+
+
 @app.post("/api/workflow")
 def create_workflow(req: WorkflowCreate):
     global WORKFLOW_ID
@@ -70,15 +143,21 @@ def create_workflow(req: WorkflowCreate):
 @app.post("/api/run")
 def run_workflow(req: RunRequest):
     dag = generate_dag_workflow("workflow")
-    t = threading.Thread(target=execute_workflow, args=(dag, req.workers, req.strategy), daemon=True)
+    global RUN_SEQ
+    with STATE_LOCK:
+        RUN_SEQ += 1
+        run_id = RUN_SEQ
+    t = threading.Thread(target=execute_workflow,
+                         args=(dag, req.workers, req.strategy, run_id), daemon=True)
     t.start()
     return {
+        "runId": run_id,
         "workflow": {"id": req.workflowId, "name": "workflow", "nodes": dag["nodes"], "edges": dag["edges"]},
-        "logs": [], "circuitBreakers": [], "completed": False
+        "logs": [], "circuitBreakers": [], "completed": False, "score": None
     }
 
 
-def execute_workflow(dag, workers, strategy):
+def execute_workflow(dag, workers, strategy, run_id):
     nodes = dag["nodes"]
     durations = dag["durations"]
     edges = dag["edges"]
@@ -97,16 +176,9 @@ def execute_workflow(dag, workers, strategy):
     running_tasks = {}
     completed = set()
 
-    def send_update(completed_flag=False):
-        payload = {
-            "workflow": {"id": 1, "name": "workflow", "nodes": nodes, "edges": edges},
-            "logs": logs[-30:],
-            "circuitBreakers": [{"taskId": k, **v} for k, v in cb_state.items()],
-            "completed": completed_flag
-        }
-        for ws in ACTIVE_CLIENTS:
-            try: asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), asyncio.get_event_loop())
-            except: pass
+    def send_update(completed_flag=False, score=None):
+        broadcast(build_snapshot(run_id, nodes, edges, logs, cb_state,
+                                 completed_flag, score=score))
         time.sleep(0.3)
 
     while ready or running_tasks:
@@ -171,13 +243,36 @@ def execute_workflow(dag, workers, strategy):
         if len(completed) == len(nodes):
             break
 
-    send_update(True)
+    # 同一次执行到此为止：按最终状态算一次分，冻结成快照，之后不再变动
+    score = build_score(run_id, nodes, durations)
+    snapshot = build_snapshot(run_id, nodes, edges, logs, cb_state, True, score=score)
+    global LATEST_RUN
+    with STATE_LOCK:
+        LATEST_RUN = snapshot
+    broadcast(snapshot)
+
+
+@app.get("/api/runs/latest")
+def get_latest_run():
+    """重开页面时取最近一次已经冻结的执行结果（含评分）"""
+    with STATE_LOCK:
+        return copy.deepcopy(LATEST_RUN) if LATEST_RUN else None
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     ACTIVE_CLIENTS.append(ws)
+    # 新连接立刻收到最近一次冻结结果，重开页面不会停留在旧的本地残留上
+    with STATE_LOCK:
+        snapshot = copy.deepcopy(LATEST_RUN) if LATEST_RUN else None
+    if snapshot is not None:
+        try:
+            await ws.send_text(json.dumps(snapshot))
+        except Exception:
+            if ws in ACTIVE_CLIENTS:
+                ACTIVE_CLIENTS.remove(ws)
+            return
     try:
         while True: await ws.receive_text()
     except:
