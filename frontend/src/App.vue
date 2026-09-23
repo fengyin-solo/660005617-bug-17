@@ -20,6 +20,7 @@
         <DAGCanvas />
       </div>
       <div class="side-area">
+        <ScorePanel />
         <LogPanel />
         <CircuitBreakerPanel />
       </div>
@@ -30,6 +31,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import DAGCanvas from './components/DAGCanvas.vue'
+import ScorePanel from './components/ScorePanel.vue'
 import LogPanel from './components/LogPanel.vue'
 import CircuitBreakerPanel from './components/CircuitBreakerPanel.vue'
 import { useDAGStore } from './store/dag'
@@ -37,7 +39,7 @@ const store = useDAGStore()
 const wfName = ref('data-pipeline')
 function create() { store.createWorkflow(wfName.value) }
 function run() { store.run() }
-onMounted(() => store.connectWS())
+onMounted(() => { store.hydrateLatest(); store.connectWS() })
 onUnmounted(() => store.disconnectWS())
 </script>
 
